@@ -3,8 +3,8 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'bazos-byt-notifier'
-primary_region = 'fra'
+app = "bazos-parser-apartments"
+primary_region = "fra"  # Frankfurt — closest to SK
 
 [build]
   dockerfile = 'Dockerfile'
