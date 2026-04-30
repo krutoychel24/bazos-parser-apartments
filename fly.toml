@@ -1,7 +1,7 @@
 # fly.toml — bazos.sk byt notifier
 # Replace `app` name with your own (must be globally unique on fly.io).
 
-app = "bazos-byt-notifier"
+app = "bazos-parser-apartments"
 primary_region = "fra"  # Frankfurt — closest to SK
 
 [build]
