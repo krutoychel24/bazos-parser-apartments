@@ -1,5 +1,3 @@
-# bazos-parcer
-
 ![poster](image_for_readme.png)
 
 Telegram bot that monitors [reality.bazos.sk](https://reality.bazos.sk) and sends new apartment rental listings matching your filters.
