@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for bazos-byt-notifier on 2026-04-30T20:12:20Z
+# fly.toml app configuration file generated for bazos-parser-apartments on 2026-04-30T20:17:18Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "bazos-parser-apartments"
-primary_region = "fra"  # Frankfurt — closest to SK
+app = 'bazos-parser-apartments'
+primary_region = 'fra'
 
 [build]
   dockerfile = 'Dockerfile'
