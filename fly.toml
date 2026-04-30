@@ -1,0 +1,32 @@
+# fly.toml — bazos.sk byt notifier
+# Replace `app` name with your own (must be globally unique on fly.io).
+
+app = "bazos-byt-notifier"
+primary_region = "fra"  # Frankfurt — closest to SK
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  CHECK_INTERVAL_SEC = "600"
+  DB_PATH = "/data/bazos.sqlite3"
+  PYTHONUNBUFFERED = "1"
+
+# Persistent SQLite storage
+[[mounts]]
+  source = "bazos_data"
+  destination = "/data"
+
+# Long-running poller — no public HTTP service.
+# Single shared-cpu-1x@256MB instance is enough.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+
+[deploy]
+  strategy = "immediate"
+
+# Keep one machine alive 24/7 (don't auto-stop — bot needs to poll).
+[processes]
+  app = "python -u bot.py"
