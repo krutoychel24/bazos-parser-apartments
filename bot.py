@@ -1,9 +1,10 @@
-"""Telegram bot — bazos.sk apartment notifier with inline-menu UI."""
+"""Telegram bot — Bazos and OLX apartment notifier with inline-menu UI."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+import re
 from html import escape
 
 from telegram import InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -19,18 +20,22 @@ from telegram.ext import (
 )
 
 import menus
-from scraper import Ad, fetch, fetch_detail
+from olx_scraper import resolve_location
+from scraper import Ad
+from sources import SOURCE_LABELS, fetch_all, fetch_detail
 from storage import DEFAULT_FILTERS, FILTER_KEYS, Storage
 
 log = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "600"))
+TELEGRAM_TIMEOUT_SEC = float(os.environ.get("TELEGRAM_TIMEOUT_SEC", "30"))
 DB_PATH = os.environ.get("DB_PATH", "/data/bazos.sqlite3")
 MAX_NEW_PER_TICK = 10
 
 WELCOME = (
     "👋 <b>Привет!</b>\n\n"
-    "Я мониторю <a href=\"https://reality.bazos.sk\">reality.bazos.sk</a> "
+    "Я мониторю <a href=\"https://reality.bazos.sk\">Bazoš</a> и "
+    "<a href=\"https://www.olx.ua\">OLX.ua</a> "
     "и шлю новые объявления об аренде по твоим фильтрам.\n\n"
     "Управляй мной кнопками ниже. Команды тоже работают (см. /help)."
 )
@@ -44,10 +49,12 @@ HELP_TEXT = (
     "/filters — текущие фильтры\n"
     "/stop — отписаться\n\n"
     "<b>Как работают фильтры</b>\n"
-    "• <b>PSČ</b> — почтовый индекс центральной точки (e.g. 04001 = Košice)\n"
-    "• <b>Радиус</b> — км от PSČ\n"
-    "• <b>Цена от/до</b> — €/мес\n"
-    "• <b>Поиск</b> — фраза в заголовке/описании\n"
+    "• <b>Источники</b> — Bazoš, OLX или оба\n"
+    "• <b>Bazoš PSČ/радиус</b> — словацкий индекс и расстояние\n"
+    "• <b>Bazoš цена</b> — €/мес\n"
+    "• <b>OLX локация</b> — просто название города, например Кременчуг\n"
+    "• <b>OLX цена</b> — грн/мес\n"
+    "• <b>Поиск</b> — общая фраза для обоих источников\n"
     "• <b>Сортировка</b> — обычно \"по дате\", не трогай\n\n"
     "Первая выдача после /start помечается как просмотренная — "
     "тебе придут только реально новые объявления."
@@ -177,8 +184,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await show_main(update, ctx)
     if is_new:
         try:
-            ads = fetch(storage.get_filters(chat_id))
-            storage.prime_seen(chat_id, [a.ad_id for a in ads])
+            result = fetch_all(storage.get_filters(chat_id))
+            for source, source_ads in result.by_source.items():
+                storage.prime_seen(
+                    chat_id, [ad.ad_id for ad in source_ads], source=source
+                )
+                storage.mark_source_primed(chat_id, source)
+            ads = result.ads
             await update.effective_chat.send_message(
                 f"🔇 Текущая выдача ({len(ads)} объявлений) помечена как просмотренная.\n"
                 "Слать буду только новые."
@@ -204,8 +216,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     storage = _storage(ctx)
     storage.add_subscriber(chat_id)
     msg = await update.message.reply_text("⏳ Проверяю…")
-    sent = await _check_chat(ctx, chat_id, storage.get_filters(chat_id),
-                              force_announce=True)
+    sent = await _check_chat(ctx, chat_id, storage.get_filters(chat_id))
     await msg.edit_text("Готово. Новых объявлений нет." if sent == 0
                        else f"Готово. Отправил: {sent}")
 
@@ -253,8 +264,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data == "m:check":
         await q.answer("Проверяю…", show_alert=False)
-        sent = await _check_chat(ctx, chat_id, storage.get_filters(chat_id),
-                                  force_announce=True)
+        sent = await _check_chat(ctx, chat_id, storage.get_filters(chat_id))
         msg = "Новых нет." if sent == 0 else f"Отправил: {sent}"
         await show_main(update, ctx, prefix=msg)
         return
@@ -352,7 +362,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         new_status = {"c": "contacted", "d": "disliked", "n": "new"}[action]
         storage.set_status(chat_id, ad_id, new_status)
         # Refresh buttons under the original ad message in place.
-        ad_url = _ad_url(ad_id)
+        stored_ad = storage.get_ad(chat_id, ad_id)
+        ad_url = stored_ad.get("url") or _ad_url(ad_id)
         try:
             await q.edit_message_reply_markup(
                 reply_markup=menus.ad_buttons(ad_id, ad_url, new_status)
@@ -379,7 +390,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _ad_url(ad_id: str) -> str:
     """Reconstruct ad URL from ID (slug isn't strictly needed for the redirect)."""
+    if ad_id.startswith("olx:"):
+        # OLX URLs require a slug that cannot be reconstructed from the ID.
+        # Sent ads always have their exact URL in SQLite; this is only a fallback.
+        return "https://www.olx.ua/"
     return f"https://reality.bazos.sk/inzerat/{ad_id}/"
+
+
+def _format_price(price: int | None, currency: str = "EUR") -> str:
+    if price is None:
+        return "—"
+    symbol = {"EUR": "€", "UAH": "грн", "PLN": "zł"}.get(currency, currency)
+    return f"{price} {symbol}"
 
 
 async def show_status_list(
@@ -412,8 +434,9 @@ async def show_status_list(
         price = r.get("price")
         loc   = r.get("location") or ""
         author = r.get("author") or ""
+        currency = r.get("currency") or "EUR"
         when  = r.get("status_at") or ""
-        price_s = f"💰 {price} €" if price else "💰 —"
+        price_s = f"💰 {_format_price(price, currency)}"
         author_s = f"\n👤 {escape(author)}" if author else ""
         text = (
             f"<b>{escape(title_t)}</b>\n"
@@ -456,6 +479,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                          reply_markup=menus.cancel_menu())
         return
 
+    if awaiting == "olx_location" and raw:
+        try:
+            resolve_location(raw)
+        except Exception as exc:
+            log.warning("OLX location resolution failed for %r: %s", raw, exc)
+            await update.message.reply_text(
+                "❌ Не нашёл такой город на OLX. Проверь написание и попробуй ещё раз.",
+                reply_markup=menus.cancel_menu(),
+            )
+            return
+
     storage = _storage(ctx)
     storage.add_subscriber(update.effective_chat.id)
     storage.update_filter(update.effective_chat.id, awaiting, raw)
@@ -469,9 +503,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _validate_filter(key: str, value: str) -> str | None:
     """Return error string if invalid, None if OK."""
-    if key in ("cenaod", "cenado"):
+    if key in ("cenaod", "cenado", "olx_cenaod", "olx_cenado"):
         if value and not value.isdigit():
-            return "Цена должна быть числом (только цифры, без €)."
+            return "Цена должна быть числом (только цифры, без валюты)."
         if value and int(value) > 1_000_000:
             return "Цена слишком большая."
     elif key == "humkreis":
@@ -481,6 +515,14 @@ def _validate_filter(key: str, value: str) -> str | None:
     elif key == "hlokalita":
         if value and (not value.isdigit() or len(value) != 5):
             return "PSČ — 5 цифр (e.g. 04001)."
+    elif key == "olx_location":
+        if len(value) > 80:
+            return "Название города слишком длинное."
+        if value and not re.fullmatch(r"[\w\s.'’\-:]+", value, flags=re.UNICODE):
+            return "В названии города есть недопустимые символы."
+    elif key == "sources":
+        if value not in ("bazos", "olx", "bazos,olx"):
+            return "Источники: bazos, olx или bazos,olx."
     elif key == "hledat":
         if len(value) > 100:
             return "Слишком длинная фраза (>100 символов)."
@@ -495,11 +537,13 @@ def _validate_filter(key: str, value: str) -> str | None:
 # ----------------------------------------------------------------------- #
 
 def _build_caption(ad: Ad, author: str = "") -> str:
-    price_s = f"{ad.price} €" if ad.price is not None else "—"
+    price_s = _format_price(ad.price, ad.currency)
     desc = ad.description[:300] + ("…" if len(ad.description) > 300 else "")
     author_line = f"👤 {escape(author)}\n" if author else ""
+    source_label = SOURCE_LABELS.get(ad.source, ad.source)
     return (
         f"<b>{escape(ad.title)}</b>\n"
+        f"🏷 {escape(source_label)}\n"
         f"💰 {price_s}  |  📍 {escape(ad.location)}\n"
         f"{author_line}"
         f"{escape(desc)}\n"
@@ -515,10 +559,10 @@ async def _send_ad(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ad: Ad) -> None
     """
     storage = _storage(ctx)
 
-    images: list[str] = []
-    author = ""
+    images: list[str] = list(ad.images)
+    author = ad.author
     try:
-        detail = fetch_detail(ad.ad_id, ad.url)
+        detail = fetch_detail(ad)
         images = detail.images
         author = detail.author
     except Exception as e:
@@ -533,7 +577,7 @@ async def _send_ad(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ad: Ad) -> None
     storage.mark_seen_with_meta(
         chat_id, ad.ad_id,
         title=ad.title, price=ad.price, location=ad.location,
-        url=ad.url, author=author,
+        url=ad.url, author=author, source=ad.source, currency=ad.currency,
     )
 
     kb = menus.ad_buttons(ad.ad_id, ad.url, status="new")
@@ -579,31 +623,37 @@ async def _check_chat(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     filters: dict,
-    force_announce: bool = False,
 ) -> int:
     storage = _storage(ctx)
-    try:
-        ads = fetch(filters)
-    except Exception as e:
-        log.exception("fetch failed for chat %s: %s", chat_id, e)
+    result = fetch_all(filters)
+    if result.errors and not result.by_source:
+        log.error("all sources failed for chat %s", chat_id)
         storage.record_tick(chat_id, sent=0, error=True)
         return 0
 
+    ads: list[Ad] = []
+    for source, source_ads in result.by_source.items():
+        if not storage.is_source_primed(chat_id, source):
+            storage.prime_seen(
+                chat_id, [ad.ad_id for ad in source_ads], source=source
+            )
+            storage.mark_source_primed(chat_id, source)
+            log.info(
+                "primed %d existing %s ads for chat %s",
+                len(source_ads), SOURCE_LABELS.get(source, source), chat_id,
+            )
+            continue
+        ads.extend(source_ads)
+
     if not ads:
-        storage.record_tick(chat_id, sent=0)
+        storage.record_tick(chat_id, sent=0, error=bool(result.errors))
         return 0
 
     ad_ids = [a.ad_id for a in ads]
-    is_first = not storage.has_seen_any(chat_id)
-    if is_first and not force_announce:
-        storage.prime_seen(chat_id, ad_ids)
-        storage.record_tick(chat_id, sent=0)
-        return 0
-
     unseen = storage.filter_unseen(chat_id, ad_ids)
     new_ads = [a for a in ads if a.ad_id in unseen]
     if not new_ads:
-        storage.record_tick(chat_id, sent=0)
+        storage.record_tick(chat_id, sent=0, error=bool(result.errors))
         return 0
 
     new_ads = list(reversed(new_ads))
@@ -616,7 +666,7 @@ async def _check_chat(
         await _send_ad(ctx, chat_id, ad)
         storage.mark_seen(chat_id, [ad.ad_id])
         sent += 1
-    storage.record_tick(chat_id, sent=sent)
+    storage.record_tick(chat_id, sent=sent, error=bool(result.errors))
     return sent
 
 
@@ -641,7 +691,15 @@ async def job_check_all(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ----------------------------------------------------------------------- #
 
 def build_app(token: str, db_path: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(TELEGRAM_TIMEOUT_SEC)
+        .read_timeout(TELEGRAM_TIMEOUT_SEC)
+        .write_timeout(TELEGRAM_TIMEOUT_SEC)
+        .pool_timeout(TELEGRAM_TIMEOUT_SEC)
+        .build()
+    )
     app.bot_data["storage"] = Storage(db_path)
 
     app.add_handler(CommandHandler("start",   cmd_start))
@@ -676,6 +734,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs full Telegram request URLs, which include the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN env var is required")
@@ -688,6 +748,9 @@ def main() -> None:
     app = build_app(token, db_path)
     app.post_init = _post_init
     log.info("starting bot, interval=%ss db=%s", CHECK_INTERVAL_SEC, db_path)
+    # Python 3.14 no longer creates a default loop for the main thread, while
+    # python-telegram-bot 21.x still expects one in run_polling().
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

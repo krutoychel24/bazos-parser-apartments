@@ -26,16 +26,25 @@ from storage import DEFAULT_FILTERS
 
 # Filter key → human label
 FILTER_LABELS = {
-    "hlokalita": "📮 PSČ",
-    "humkreis":  "📏 Радиус",
-    "cenaod":    "💶 Цена от",
-    "cenado":    "💶 Цена до",
+    "sources":      "🏷 Источники",
+    "hlokalita":    "📮 Bazoš PSČ",
+    "humkreis":     "📏 Bazoš радиус",
+    "cenaod":       "💶 Bazoš цена от",
+    "cenado":       "💶 Bazoš цена до",
+    "olx_location": "📍 OLX локация",
+    "olx_cenaod":   "💴 OLX цена от",
+    "olx_cenado":   "💴 OLX цена до",
     "hledat":    "🔎 Поиск",
     "order":     "↕️ Сортировка",
 }
 
 # Filter key → ordered list of preset values shown as buttons
 FILTER_PRESETS: dict[str, list[tuple[str, str]]] = {
+    "sources": [
+        ("Bazoš + OLX", "bazos,olx"),
+        ("только Bazoš", "bazos"),
+        ("только OLX", "olx"),
+    ],
     "humkreis": [
         ("0 (точно)", "0"), ("1 км", "1"), ("2 км", "2"),
         ("5 км", "5"),     ("10 км", "10"), ("20 км", "20"),
@@ -59,12 +68,37 @@ FILTER_PRESETS: dict[str, list[tuple[str, str]]] = {
         ("Bratislava 81101", "81101"),
         ("очистить", ""),
     ],
+    "olx_location": [
+        ("Киев", "Киев"),
+        ("Кременчуг", "Кременчуг"),
+        ("вся Украина", ""),
+    ],
+    "olx_cenaod": [
+        ("любая", ""),
+        ("5000", "5000"), ("10000", "10000"),
+        ("15000", "15000"), ("20000", "20000"),
+    ],
+    "olx_cenado": [
+        ("без лимита", ""),
+        ("10000", "10000"), ("15000", "15000"),
+        ("20000", "20000"), ("30000", "30000"),
+        ("50000", "50000"),
+    ],
     "order": [
         ("по дате", ""),
         ("дешевле", "1"),
         ("дороже", "2"),
     ],
     # hledat — only custom input, no presets
+}
+
+DISPLAY_VALUES = {
+    "sources": {
+        "bazos,olx": "Bazoš + OLX",
+        "bazos": "Bazoš",
+        "olx": "OLX",
+    },
+    "olx_location": {"25:268": "Киев"},
 }
 
 
@@ -94,11 +128,18 @@ def _short(value: str, n: int = 18) -> str:
     return value if len(value) <= n else value[: n - 1] + "…"
 
 
+def _display_value(key: str, value: str) -> str:
+    return DISPLAY_VALUES.get(key, {}).get(value, value)
+
+
 def filters_menu(filters: dict) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for key in ("hlokalita", "humkreis", "cenaod", "cenado", "hledat", "order"):
+    for key in (
+        "sources", "hlokalita", "humkreis", "cenaod", "cenado",
+        "olx_location", "olx_cenaod", "olx_cenado", "hledat", "order",
+    ):
         label = FILTER_LABELS[key]
-        cur = _short(filters.get(key, ""))
+        cur = _short(_display_value(key, filters.get(key, "")))
         rows.append([
             InlineKeyboardButton(
                 f"{label}: {cur}",
@@ -131,7 +172,7 @@ def filter_edit_menu(key: str, current: str) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton("✏️ Ввести вручную", callback_data=f"f:custom:{key}"),
     ])
-    if current:
+    if current and key != "sources":
         rows.append([InlineKeyboardButton("🗑 Очистить", callback_data=f"f:clear:{key}")])
     rows.append([InlineKeyboardButton("⬅️ К фильтрам", callback_data="m:filters")])
     return InlineKeyboardMarkup(rows)
@@ -171,8 +212,9 @@ def ad_buttons(ad_id: str, ad_url: str, status: str = "new") -> InlineKeyboardMa
     """
     contacted = "✅ Отписал" if status == "contacted" else "✉️ Отписал"
     disliked  = "✅ Не нравится" if status == "disliked"  else "👎 Не нравится"
+    site = "OLX" if "olx." in ad_url.lower() else "Bazoš"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Открыть на bazos", url=ad_url)],
+        [InlineKeyboardButton(f"🔗 Открыть на {site}", url=ad_url)],
         [InlineKeyboardButton(contacted, callback_data=f"ad:c:{ad_id}"),
          InlineKeyboardButton(disliked,  callback_data=f"ad:d:{ad_id}")],
         [InlineKeyboardButton("↩️ Сбросить", callback_data=f"ad:n:{ad_id}")],
@@ -209,8 +251,12 @@ def format_filters(filters: dict) -> str:
     """HTML-safe pretty print for filter values."""
     from html import escape
     lines = []
-    for key in ("hlokalita", "humkreis", "cenaod", "cenado", "hledat", "order"):
+    for key in (
+        "sources", "hlokalita", "humkreis", "cenaod", "cenado",
+        "olx_location", "olx_cenaod", "olx_cenado", "hledat", "order",
+    ):
         label = FILTER_LABELS[key]
-        val = filters.get(key, "") or "—"
+        raw = filters.get(key, "")
+        val = _display_value(key, raw) if raw else "—"
         lines.append(f"{label}: <code>{escape(str(val))}</code>")
     return "\n".join(lines)

@@ -33,9 +33,16 @@ class Ad:
     location: str
     image: str | None
     description: str
+    source: str = "bazos"
+    currency: str = "EUR"
+    images: list[str] = field(default_factory=list)
+    author: str = ""
 
     def telegram_text(self) -> str:
-        price = f"{self.price} €" if self.price is not None else "—"
+        symbol = {"EUR": "€", "UAH": "грн", "PLN": "zł"}.get(
+            self.currency, self.currency
+        )
+        price = f"{self.price} {symbol}" if self.price is not None else "—"
         desc = self.description[:300] + ("…" if len(self.description) > 300 else "")
         return (
             f"<b>{_escape(self.title)}</b>\n"

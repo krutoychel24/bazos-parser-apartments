@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/bazos.sqlite3
+      TZ: Europe/Kyiv
+    volumes:
+      - ./data:/data

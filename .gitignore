@@ -5,6 +5,8 @@ venv/
 .env
 *.sqlite3
 *.sqlite3-journal
+*.log
+data/
 bazos_sample.html
 .idea/
 .vscode/

@@ -7,11 +7,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 DEFAULT_FILTERS = {
+    "sources": "bazos,olx",
     "hledat": "",
     "hlokalita": "04001",
     "humkreis": "10",
     "cenaod": "",
     "cenado": "550",
+    "olx_location": "Киев",
+    "olx_cenaod": "",
+    "olx_cenado": "",
     "order": "",
 }
 
@@ -59,7 +63,15 @@ class Storage:
                     location     TEXT,
                     url          TEXT,
                     author       TEXT,
+                    source       TEXT    NOT NULL DEFAULT 'bazos',
+                    currency     TEXT    NOT NULL DEFAULT 'EUR',
                     PRIMARY KEY (chat_id, ad_id)
+                );
+                CREATE TABLE IF NOT EXISTS primed_sources (
+                    chat_id      INTEGER NOT NULL,
+                    source       TEXT    NOT NULL,
+                    primed_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, source)
                 );
                 """
             )
@@ -84,10 +96,18 @@ class Storage:
                 ("location",  "ALTER TABLE seen ADD COLUMN location TEXT"),
                 ("url",       "ALTER TABLE seen ADD COLUMN url TEXT"),
                 ("author",    "ALTER TABLE seen ADD COLUMN author TEXT"),
+                ("source",    "ALTER TABLE seen ADD COLUMN source TEXT NOT NULL DEFAULT 'bazos'"),
+                ("currency",  "ALTER TABLE seen ADD COLUMN currency TEXT NOT NULL DEFAULT 'EUR'"),
             ):
                 if col not in seen_cols:
                     c.execute(ddl)
             c.execute("CREATE INDEX IF NOT EXISTS idx_seen_status ON seen(chat_id, status)")
+            # Rebuild source-prime state from historical rows. Old rows receive
+            # the migration default (Bazos); new OLX primes store source="olx".
+            c.execute(
+                "INSERT OR IGNORE INTO primed_sources (chat_id, source) "
+                "SELECT DISTINCT chat_id, source FROM seen"
+            )
 
     def add_subscriber(self, chat_id: int) -> None:
         with self._conn() as c:
@@ -100,6 +120,7 @@ class Storage:
         with self._conn() as c:
             c.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
             c.execute("DELETE FROM seen WHERE chat_id = ?", (chat_id,))
+            c.execute("DELETE FROM primed_sources WHERE chat_id = ?", (chat_id,))
 
     def set_enabled(self, chat_id: int, enabled: bool) -> None:
         with self._conn() as c:
@@ -122,7 +143,9 @@ class Storage:
             ).fetchone()
         if not row:
             return dict(DEFAULT_FILTERS)
-        return json.loads(row["filters"])
+        filters = dict(DEFAULT_FILTERS)
+        filters.update(json.loads(row["filters"]))
+        return filters
 
     def update_filter(self, chat_id: int, key: str, value: str) -> dict:
         if key not in FILTER_KEYS:
@@ -163,14 +186,22 @@ class Storage:
         seen = {r["ad_id"] for r in rows}
         return set(ad_ids) - seen
 
-    def mark_seen(self, chat_id: int, ad_ids: list[str]) -> None:
+    def mark_seen(
+        self, chat_id: int, ad_ids: list[str], source: str | None = None
+    ) -> None:
         if not ad_ids:
             return
         with self._conn() as c:
-            c.executemany(
-                "INSERT OR IGNORE INTO seen (chat_id, ad_id) VALUES (?, ?)",
-                [(chat_id, a) for a in ad_ids],
-            )
+            if source:
+                c.executemany(
+                    "INSERT OR IGNORE INTO seen (chat_id, ad_id, source) VALUES (?, ?, ?)",
+                    [(chat_id, ad_id, source) for ad_id in ad_ids],
+                )
+            else:
+                c.executemany(
+                    "INSERT OR IGNORE INTO seen (chat_id, ad_id) VALUES (?, ?)",
+                    [(chat_id, ad_id) for ad_id in ad_ids],
+                )
 
     def mark_seen_with_meta(
         self,
@@ -182,22 +213,36 @@ class Storage:
         location: str = "",
         url: str = "",
         author: str = "",
+        source: str = "bazos",
+        currency: str = "EUR",
     ) -> None:
         """Insert/update a seen row with full ad metadata (used when sending)."""
         with self._conn() as c:
             c.execute(
                 """
-                INSERT INTO seen (chat_id, ad_id, title, price, location, url, author)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO seen
+                    (chat_id, ad_id, title, price, location, url, author, source, currency)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, ad_id) DO UPDATE SET
                     title    = COALESCE(excluded.title,    seen.title),
                     price    = COALESCE(excluded.price,    seen.price),
                     location = COALESCE(excluded.location, seen.location),
                     url      = COALESCE(excluded.url,      seen.url),
-                    author   = COALESCE(NULLIF(excluded.author, ''), seen.author)
+                    author   = COALESCE(NULLIF(excluded.author, ''), seen.author),
+                    source   = excluded.source,
+                    currency = excluded.currency
                 """,
-                (chat_id, ad_id, title, price, location, url, author),
+                (chat_id, ad_id, title, price, location, url, author, source, currency),
             )
+
+    def get_ad(self, chat_id: int, ad_id: str) -> dict:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT ad_id, title, price, location, url, author, source, currency "
+                "FROM seen WHERE chat_id = ? AND ad_id = ?",
+                (chat_id, ad_id),
+            ).fetchone()
+        return dict(row) if row else {}
 
     def update_author(self, chat_id: int, ad_id: str, author: str) -> None:
         if not author:
@@ -241,15 +286,30 @@ class Storage:
                 (chat_id, status),
             ).fetchone()["n"]
             rows = c.execute(
-                "SELECT ad_id, title, price, location, url, author, status_at "
+                "SELECT ad_id, title, price, location, url, author, source, currency, status_at "
                 "FROM seen WHERE chat_id = ? AND status = ? "
                 "ORDER BY status_at DESC LIMIT ? OFFSET ?",
                 (chat_id, status, limit, offset),
             ).fetchall()
         return [dict(r) for r in rows], total
 
-    def prime_seen(self, chat_id: int, ad_ids: list[str]) -> None:
-        self.mark_seen(chat_id, ad_ids)
+    def prime_seen(self, chat_id: int, ad_ids: list[str], source: str = "bazos") -> None:
+        self.mark_seen(chat_id, ad_ids, source=source)
+
+    def mark_source_primed(self, chat_id: int, source: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO primed_sources (chat_id, source) VALUES (?, ?)",
+                (chat_id, source),
+            )
+
+    def is_source_primed(self, chat_id: int, source: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM primed_sources WHERE chat_id = ? AND source = ?",
+                (chat_id, source),
+            ).fetchone()
+        return row is not None
 
     def has_seen_any(self, chat_id: int) -> bool:
         with self._conn() as c:
